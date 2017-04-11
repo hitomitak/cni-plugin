@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	etcdclient "github.com/coreos/etcd/client"
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega/gexec"
+	k8sbackend "github.com/projectcalico/libcalico-go/lib/backend/k8s"
 	"github.com/vishvananda/netlink"
 )
 
@@ -35,6 +37,13 @@ func init() {
 	cfg := etcdclient.Config{Endpoints: []string{"http://127.0.0.1:2379"}}
 	c, _ := etcdclient.New(cfg)
 	kapi = etcdclient.NewKeysAPI(c)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Delete everything under /calico from etcd
@@ -70,7 +79,9 @@ func WipeK8sPods() {
 	}
 }
 
-func RunIPAMPlugin(netconf, command, args string) (types.Result, int) {
+// RunIPAMPlugin sets ENV vars required then calls the IPAM plugin
+// specified in the config and returns the result and exitCode.
+func RunIPAMPlugin(netconf, command, args string) (types.Result, types.Error, int) {
 	conf := types.NetConf{}
 	if err := json.Unmarshal([]byte(netconf), &conf); err != nil {
 		panic(fmt.Errorf("failed to load netconf: %v", err))
@@ -97,46 +108,74 @@ func RunIPAMPlugin(netconf, command, args string) (types.Result, int) {
 	session.Wait(5)
 	exitCode := session.ExitCode()
 	result := types.Result{}
+	error := types.Error{}
 	stdout := session.Out.Contents()
 	if exitCode == 0 {
-
 		if command == "ADD" {
 			if err := json.Unmarshal(stdout, &result); err != nil {
 				panic(fmt.Errorf("failed to load result: %s %v", stdout, err))
 			}
 		}
+	} else {
+		if err := json.Unmarshal(stdout, &error); err != nil {
+			panic(fmt.Errorf("failed to load error: %s %v", stdout, err))
+		}
 	}
 
-	return result, exitCode
+	return result, error, exitCode
 }
 
-func CreateContainer(netconf string, k8sName string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, err error) {
-	targetNs, err := ns.NewNS()
+func CreateContainerNamespace() (containerNs ns.NetNS, containerId, netnspath string, err error) {
+	return CreateContainerNamespaceWithCid("")
+}
+
+func CreateContainerNamespaceWithCid(container_id string) (containerNs ns.NetNS, containerId, netnspath string, err error) {
+	containerNs, err = ns.NewNS()
 	if err != nil {
-		return "", "", nil, nil, nil, nil, err
+		return nil, "", "", err
 	}
 
-	// Create a random "container ID"
-	netnspath = targetNs.Path()
+	netnspath = containerNs.Path()
 	netnsname := path.Base(netnspath)
-	container_id = netnsname[:10]
+	containerId = netnsname[:10]
 
-	err = targetNs.Do(func(_ ns.NetNS) error {
+	if container_id != "" {
+		containerId = container_id
+	}
+
+	err = containerNs.Do(func(_ ns.NetNS) error {
 		lo, err := netlink.LinkByName("lo")
 		if err != nil {
 			return err
 		}
-		err = netlink.LinkSetUp(lo)
-		return err
-
-		return nil
+		return netlink.LinkSetUp(lo)
 	})
+
+	return
+}
+
+func CreateContainer(netconf string, k8sName string, ip string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, err error) {
+	return CreateContainerWithId(netconf, k8sName, ip, "")
+}
+
+// Create container with the giving containerId when containerId is not empty
+func CreateContainerWithId(netconf string, k8sName string, ip string, containerId string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, err error) {
+	targetNs, container_id, netnspath, err := CreateContainerNamespaceWithCid(containerId)
+
+	if err != nil {
+		return "", "", nil, nil, nil, nil, err
+	}
 
 	// Set up the env for running the CNI plugin
 	//TODO pass in the env properly
 	var k8s_env = ""
 	if k8sName != "" {
 		k8s_env = fmt.Sprintf("CNI_ARGS=\"K8S_POD_NAME=%s;K8S_POD_NAMESPACE=test;K8S_POD_INFRA_CONTAINER_ID=whatever\"", k8sName)
+
+		// Append IP=<ip> to CNI_ARGS only if it's not an empty string.
+		if ip != "" {
+			k8s_env = fmt.Sprintf("%s;IP=%s\"", strings.TrimRight(k8s_env, "\""), ip)
+		}
 	}
 	cni_env := fmt.Sprintf("CNI_COMMAND=ADD CNI_CONTAINERID=%s CNI_NETNS=%s CNI_IFNAME=eth0 CNI_PATH=dist %s", container_id, netnspath, k8s_env)
 
@@ -176,12 +215,52 @@ func CreateContainer(netconf string, k8sName string) (container_id, netnspath st
 	return
 }
 
-func DeleteContainer(netconf, netnspath, name string) (session *gexec.Session, err error) {
+// Create veth pair on host
+func CreateHostVeth(containerId string, k8sName string, k8sNamespace string) error {
+	hostVethName := "cali" + containerId[:min(11, len(containerId))]
+	if k8sName != "" {
+		workload := fmt.Sprintf("%s.%s", k8sNamespace, k8sName)
+		hostVethName = k8sbackend.VethNameForWorkload(workload)
+	}
+
+	peerVethName := "calipeer"
+
+	// Clean up if peer Veth exists.
+	if oldPeerVethName, err := netlink.LinkByName(peerVethName); err == nil {
+		if err = netlink.LinkDel(oldPeerVethName); err != nil {
+			return fmt.Errorf("failed to delete old peer Veth %v: %v", oldPeerVethName, err)
+		}
+	}
+
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:  hostVethName,
+			Flags: net.FlagUp,
+			MTU:   1500,
+		},
+		PeerName: peerVethName,
+	}
+
+	if err := netlink.LinkAdd(veth); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Executes the Calico CNI plugin and return the error code of the command.
+func DeleteContainer(netconf, netnspath, name string) (exitCode int, err error) {
+	return DeleteContainerWithId(netconf, netnspath, name, "")
+}
+
+func DeleteContainerWithId(netconf, netnspath, name, containerId string) (exitCode int, err error) {
 	netnsname := path.Base(netnspath)
 	container_id := netnsname[:10]
+	if containerId != "" {
+		container_id = containerId
+	}
 	var k8s_env = ""
 	if name != "" {
-
 		k8s_env = fmt.Sprintf("CNI_ARGS=\"K8S_POD_NAME=%s;K8S_POD_NAMESPACE=test;K8S_POD_INFRA_CONTAINER_ID=whatever\"", name)
 	}
 
@@ -192,14 +271,21 @@ func DeleteContainer(netconf, netnspath, name string) (session *gexec.Session, e
 	subProcess := exec.Command("bash", "-c", fmt.Sprintf("%s dist/%s", cni_env, os.Getenv("PLUGIN")), netconf)
 	stdin, err := subProcess.StdinPipe()
 	if err != nil {
-		panic("some error found")
+		return
 	}
-
 	io.WriteString(stdin, netconf)
 	io.WriteString(stdin, "\n")
 	stdin.Close()
 
-	session, err = gexec.Start(subProcess, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
+	session, err := gexec.Start(subProcess, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
+	if err != nil {
+		return
+	}
+
+	// Call the plugin. Will force a test failure if it hangs longer than 5s.
+	session.Wait(5)
+
+	exitCode = session.ExitCode()
 	return
 }
 

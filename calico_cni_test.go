@@ -3,6 +3,7 @@ package main_test
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 
 	"net"
@@ -60,7 +61,7 @@ var _ = Describe("CalicoCni", func() {
 			}`, os.Getenv("ETCD_IP"))
 
 			It("successfully networks the namespace", func() {
-				containerID, netnspath, session, contVeth, contAddresses, contRoutes, err := CreateContainer(netconf, "")
+				containerID, netnspath, session, contVeth, contAddresses, contRoutes, err := CreateContainer(netconf, "", "")
 				Expect(err).ShouldNot(HaveOccurred())
 				Eventually(session).Should(gexec.Exit())
 
@@ -128,9 +129,8 @@ var _ = Describe("CalicoCni", func() {
 						Type:      syscall.RTN_UNICAST,
 					})))
 
-				session, err = DeleteContainer(netconf, netnspath, "")
+				_, err = DeleteContainer(netconf, netnspath, "")
 				Expect(err).ShouldNot(HaveOccurred())
-				Eventually(session).Should(gexec.Exit())
 
 				// Make sure there are no endpoints anymore
 				endpoints, err = calicoClient.WorkloadEndpoints().List(api.WorkloadEndpointMetadata{})
@@ -151,6 +151,142 @@ var _ = Describe("CalicoCni", func() {
 				Expect(err).Should(HaveOccurred())
 				Expect(err.Error()).Should(Equal("Link not found"))
 
+			})
+
+			Context("when the same hostVeth exists", func() {
+				It("successfully networks the namespace", func() {
+					container_id := fmt.Sprintf("con%d", rand.Uint32())
+					if err := CreateHostVeth(container_id, "", ""); err != nil {
+						panic(err)
+					}
+					_, netnspath, session, _, _, _, err := CreateContainerWithId(netconf, "", "", container_id)
+					Expect(err).ShouldNot(HaveOccurred())
+					Eventually(session).Should(gexec.Exit(0))
+
+					result := types.Result{}
+					if err := json.Unmarshal(session.Out.Contents(), &result); err != nil {
+						panic(err)
+					}
+
+					_, err = DeleteContainerWithId(netconf, netnspath, "", container_id)
+					Expect(err).ShouldNot(HaveOccurred())
+				})
+			})
+		})
+	})
+
+	Describe("Run Calico CNI plugin", func() {
+		Context("depricate Hostname for nodename", func() {
+			netconf := fmt.Sprintf(`
+			{
+			  "name": "net1",
+			  "type": "calico",
+			  "etcd_endpoints": "http://%s:2379",
+			  "hostname": "namedHostname",
+			  "ipam": {
+			    "type": "host-local",
+			    "subnet": "10.0.0.0/8"
+			  }
+			}`, os.Getenv("ETCD_IP"))
+
+			It("has hostname even though deprecated", func() {
+				containerID, netnspath, session, _, _, _, err := CreateContainer(netconf, "", "")
+				Expect(err).ShouldNot(HaveOccurred())
+				Eventually(session).Should(gexec.Exit())
+
+				result := types.Result{}
+				if err := json.Unmarshal(session.Out.Contents(), &result); err != nil {
+					panic(err)
+				}
+
+				// The endpoint is created in etcd
+				endpoints, err := calicoClient.WorkloadEndpoints().List(api.WorkloadEndpointMetadata{})
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(endpoints.Items).Should(HaveLen(1))
+				Expect(endpoints.Items[0].Metadata).Should(Equal(api.WorkloadEndpointMetadata{
+					Node:         "namedHostname",
+					Name:         "eth0",
+					Workload:     containerID,
+					Orchestrator: "cni",
+				}))
+
+				_, err = DeleteContainer(netconf, netnspath, "")
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+		})
+	})
+
+	Describe("Run Calico CNI plugin", func() {
+		Context("depricate Hostname for nodename", func() {
+			netconf := fmt.Sprintf(`
+			{
+			  "name": "net1",
+			  "type": "calico",
+			  "etcd_endpoints": "http://%s:2379",
+			  "hostname": "namedHostname",
+			  "nodename": "namedNodename",
+			  "ipam": {
+			    "type": "host-local",
+			    "subnet": "10.0.0.0/8"
+			  }
+			}`, os.Getenv("ETCD_IP"))
+
+			It("nodename takes precedence over hostname", func() {
+				containerID, netnspath, session, _, _, _, err := CreateContainer(netconf, "", "")
+				Expect(err).ShouldNot(HaveOccurred())
+				Eventually(session).Should(gexec.Exit())
+
+				result := types.Result{}
+				if err := json.Unmarshal(session.Out.Contents(), &result); err != nil {
+					panic(err)
+				}
+
+				// The endpoint is created in etcd
+				endpoints, err := calicoClient.WorkloadEndpoints().List(api.WorkloadEndpointMetadata{})
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(endpoints.Items).Should(HaveLen(1))
+				Expect(endpoints.Items[0].Metadata).Should(Equal(api.WorkloadEndpointMetadata{
+					Node:         "namedNodename",
+					Name:         "eth0",
+					Workload:     containerID,
+					Orchestrator: "cni",
+				}))
+
+				_, err = DeleteContainer(netconf, netnspath, "")
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+		})
+	})
+
+	Describe("DEL", func() {
+		netconf := fmt.Sprintf(`
+		{
+			"name": "net1",
+			"type": "calico",
+			"etcd_endpoints": "http://%s:2379",
+			"ipam": {
+				"type": "host-local",
+				"subnet": "10.0.0.0/8"
+			}
+		}`, os.Getenv("ETCD_IP"))
+
+		Context("when it was never called for SetUP", func() {
+			Context("and a namespace does exist", func() {
+				It("exits with 'success' error code", func() {
+					_, _, netnspath, err := CreateContainerNamespace()
+					Expect(err).ShouldNot(HaveOccurred())
+					exitCode, err := DeleteContainer(netconf, netnspath, "")
+					Expect(err).ShouldNot(HaveOccurred())
+					Expect(exitCode).To(Equal(0))
+				})
+			})
+
+			Context("and no namespace exists", func() {
+				It("exits with 'success' error code", func() {
+					exitCode, err := DeleteContainer(netconf, "/not/a/real/path1234567890", "")
+					Expect(err).ShouldNot(HaveOccurred())
+					Expect(exitCode).To(Equal(0))
+				})
 			})
 		})
 	})

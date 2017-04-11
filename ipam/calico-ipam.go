@@ -27,6 +27,7 @@ import (
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/projectcalico/cni-plugin/utils"
 	"github.com/projectcalico/libcalico-go/lib/client"
+	"github.com/projectcalico/libcalico-go/lib/errors"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 )
 
@@ -88,7 +89,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if ipamArgs.IP != nil {
 		fmt.Fprintf(os.Stderr, "Calico CNI IPAM request IP: %v\n", ipamArgs.IP)
 
-		// The hostname will be defaulted to the actual hostname if cong.Hostname is empty
+		// The hostname will be defaulted to the actual hostname if conf.Hostname is empty
 		assignArgs := client.AssignIPArgs{IP: cnet.IP{ipamArgs.IP}, HandleID: &workloadID, Hostname: conf.Hostname}
 		logger.WithField("assignArgs", assignArgs).Info("Assigning provided IP")
 		err := calicoClient.IPAM().AssignIP(assignArgs)
@@ -96,9 +97,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 			return err
 		}
 
-		ipV4Network := net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(32, 32)}
-		r.IP4 = &types.IPConfig{IP: ipV4Network}
-		logger.WithField("result.IP4", r.IP4).Info("Result IPv4")
+		var ipNetwork net.IPNet
+
+		if ipamArgs.IP.To4() == nil {
+			// It's an IPv6 address.
+			ipNetwork = net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(128, 128)}
+			r.IP6 = &types.IPConfig{IP: ipNetwork}
+			logger.WithField("result.IP6", r.IP6).Info("Result IPv6")
+		} else {
+			// It's an IPv4 address.
+			ipNetwork = net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(32, 32)}
+			r.IP4 = &types.IPConfig{IP: ipNetwork}
+			logger.WithField("result.IP4", r.IP4).Info("Result IPv4")
+		}
 	} else {
 		// Default to assigning an IPv4 address
 		num4 := 1
@@ -114,7 +125,24 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 		fmt.Fprintf(os.Stderr, "Calico CNI IPAM request count IPv4=%d IPv6=%d\n", num4, num6)
 
-		assignArgs := client.AutoAssignArgs{Num4: num4, Num6: num6, HandleID: &workloadID, Hostname: conf.Hostname}
+		v4pools, err := utils.ParsePools(conf.IPAM.IPv4Pools, true)
+		if err != nil {
+			return err
+		}
+
+		v6pools, err := utils.ParsePools(conf.IPAM.IPv6Pools, false)
+		if err != nil {
+			return err
+		}
+
+		assignArgs := client.AutoAssignArgs{
+			Num4:      num4,
+			Num6:      num6,
+			HandleID:  &workloadID,
+			Hostname:  conf.Hostname,
+			IPv4Pools: v4pools,
+			IPv6Pools: v6pools,
+		}
 		logger.WithField("assignArgs", assignArgs).Info("Auto assigning IP")
 		assignedV4, assignedV6, err := calicoClient.IPAM().AutoAssign(assignArgs)
 		fmt.Fprintf(os.Stderr, "Calico CNI IPAM assigned addresses IPv4=%v IPv6=%v\n", assignedV4, assignedV6)
@@ -166,6 +194,10 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	logger.Info("Releasing address using workloadID")
 	if err := calicoClient.IPAM().ReleaseByHandle(workloadID); err != nil {
+		if _, ok := err.(errors.ErrorResourceDoesNotExist); ok {
+			logger.WithField("workloadId", workloadID).Warn("Asked to release address but it doesn't exist. Ignoring")
+			return nil
+		}
 		return err
 	}
 

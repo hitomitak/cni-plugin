@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 
@@ -37,7 +38,7 @@ import (
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 )
 
-var hostname string
+var nodename string
 
 func init() {
 	// This ensures that main runs only on main thread (thread group leader).
@@ -45,7 +46,17 @@ func init() {
 	// must ensure that the goroutine does not jump from OS thread to thread
 	runtime.LockOSThread()
 
-	hostname, _ = os.Hostname()
+	nodename, _ = os.Hostname()
+}
+
+func updateNodename(conf NetConf, logger *log.Entry) {
+	if conf.Hostname != "" {
+		nodename = conf.Hostname
+		logger.Warn("Configuration option 'hostname' is deprecated, use 'nodename' instead.")
+	}
+	if conf.Nodename != "" {
+		nodename = conf.Nodename
+	}
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
@@ -64,14 +75,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	logger := CreateContextLogger(workload)
 
-	// Allow the hostname to be overridden by the network config
-	if conf.Hostname != "" {
-		hostname = conf.Hostname
-	}
+	// Allow the nodename to be overridden by the network config
+	updateNodename(conf, logger)
 
 	logger.WithFields(log.Fields{
 		"Orchestrator": orchestrator,
-		"Node":         hostname,
+		"Node":         nodename,
 	}).Info("Extracted identifiers")
 
 	logger.WithFields(log.Fields{"NetConfg": conf}).Info("Loaded CNI NetConf")
@@ -82,7 +91,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// Always check if there's an existing endpoint.
 	endpoints, err := calicoClient.WorkloadEndpoints().List(api.WorkloadEndpointMetadata{
-		Node:         hostname,
+		Node:         nodename,
 		Orchestrator: orchestrator,
 		Workload:     workload})
 	if err != nil {
@@ -105,7 +114,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// If running under Kubernetes then branch off into the kubernetes code, otherwise handle everything in this
 	// function.
 	if orchestrator == "k8s" {
-		if result, err = k8s.CmdAddK8s(args, conf, hostname, calicoClient, endpoint); err != nil {
+		if result, err = k8s.CmdAddK8s(args, conf, nodename, calicoClient, endpoint); err != nil {
 			return err
 		}
 	} else {
@@ -150,7 +159,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			// 2) Create the endpoint object
 			endpoint = api.NewWorkloadEndpoint()
 			endpoint.Metadata.Name = args.IfName
-			endpoint.Metadata.Node = hostname
+			endpoint.Metadata.Node = nodename
 			endpoint.Metadata.Orchestrator = orchestrator
 			endpoint.Metadata.Workload = workload
 			endpoint.Metadata.Labels = labels
@@ -269,21 +278,42 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	logger := CreateContextLogger(workload)
 
-	// Allow the hostname to be overridden by the network config
-	if conf.Hostname != "" {
-		hostname = conf.Hostname
-	}
+	// Allow the nodename to be overridden by the network config
+	updateNodename(conf, logger)
 
 	logger.WithFields(log.Fields{
 		"Workload":     workload,
 		"Orchestrator": orchestrator,
-		"Node":         hostname,
+		"Node":         nodename,
 	}).Info("Extracted identifiers")
 
 	// Always try to release the address. Don't deal with any errors till the endpoints are cleaned up.
 	fmt.Fprintf(os.Stderr, "Calico CNI releasing IP address\n")
 	logger.WithFields(log.Fields{"paths": os.Getenv("CNI_PATH"),
 		"type": conf.IPAM.Type}).Debug("Looking for IPAM plugin in paths")
+
+	// We need to replace "usePodCidr" with a valid, but dummy podCidr string with "host-local" IPAM.
+	if conf.IPAM.Type == "host-local" && strings.EqualFold(conf.IPAM.Subnet, "usePodCidr") {
+
+		// host-local IPAM releases the IP by ContainerID, so podCidr isn't really used to release the IP.
+		// It just needs a valid CIDR, but it doesn't have to be the CIDR associated with the host.
+		dummyPodCidr := "0.0.0.0/0"
+		var stdinData map[string]interface{}
+
+		if err := json.Unmarshal(args.StdinData, &stdinData); err != nil {
+			return err
+		}
+
+		logger.WithField("podCidr", dummyPodCidr).Info("Using a dummy podCidr to release the IP")
+		stdinData["ipam"].(map[string]interface{})["subnet"] = dummyPodCidr
+
+		args.StdinData, err = json.Marshal(stdinData)
+		if err != nil {
+			return err
+		}
+		logger.WithField("stdin", args.StdinData).Debug("Updated stdin data for Delete Cmd")
+	}
+
 	ipamErr := ipam.ExecDel(conf.IPAM.Type, args.StdinData)
 
 	if ipamErr != nil {
@@ -295,24 +325,39 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 
-	if err := calicoClient.WorkloadEndpoints().Delete(api.WorkloadEndpointMetadata{
+	ep := api.WorkloadEndpointMetadata{
 		Name:         args.IfName,
-		Node:         hostname,
+		Node:         nodename,
 		Orchestrator: orchestrator,
-		Workload:     workload}); err != nil {
-		return err
+		Workload:     workload}
+	if err = calicoClient.WorkloadEndpoints().Delete(ep); err != nil {
+		if _, ok := err.(errors.ErrorResourceDoesNotExist); ok {
+			logger.WithField("endpoint", ep).Info("Endpoint object does not exist, no need to clean up.")
+		} else {
+			return err
+		}
 	}
 
 	// Only try to delete the device if a namespace was passed in.
 	if args.Netns != "" {
-		fmt.Fprintf(os.Stderr, "Calico CNI deleting device in netns %s\n", args.Netns)
-		err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-			_, err = ip.DelLinkByNameAddr(args.IfName, netlink.FAMILY_V4)
+		logger.Debug("Checking namespace & device exist.")
+		devErr := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+			_, err := netlink.LinkByName(args.IfName)
 			return err
 		})
 
-		if err != nil {
-			return err
+		if devErr == nil {
+			fmt.Fprintf(os.Stderr, "Calico CNI deleting device in netns %s\n", args.Netns)
+			err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+				_, err = ip.DelLinkByNameAddr(args.IfName, netlink.FAMILY_V4)
+				return err
+			})
+
+			if err != nil {
+				return err
+			}
+		} else {
+			logger.Info("veth does not exist, no need to clean up.")
 		}
 	}
 
