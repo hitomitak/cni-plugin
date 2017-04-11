@@ -1,4 +1,4 @@
-FROM busybox
+FROM ppc64le/busybox
 
 MAINTAINER Tom Denham <tom@tigera.io>
 

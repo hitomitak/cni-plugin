@@ -12,7 +12,7 @@ CALICO_CNI_VERSION?=$(shell git describe --tags --dirty)
 # Ensure that the dist directory is always created
 MAKE_SURE_DIST_EXIST := $(shell mkdir -p dist)
 
-GO_CONTAINER_NAME?=dockerepo/glide
+GO_CONTAINER_NAME?=glide-ppc64le
 BUILD_CONTAINER_NAME=calico/cni_build_container
 BUILD_CONTAINER_MARKER=cni_build_container.created
 DEPLOY_CONTAINER_NAME=calico/cni
@@ -57,11 +57,13 @@ endif
 
 # Use this to populate the vendor directory after checking out the repository.
 # To update upstream dependencies, delete the glide.lock file first.
+
 vendor: glide.yaml
 	# To build without Docker just run "glide install -strip-vendor"
 	if [ "$(LIBCALICOGO_PATH)" != "none" ]; then \
           EXTRA_DOCKER_BIND="-v $(LIBCALICOGO_PATH):/go/src/github.com/projectcalico/libcalico-go:ro"; \
 	fi; \
+	docker build -t glide-ppc64le - < Dockerfile.glide
 	docker run --rm \
 	-v ${PWD}:/go/src/github.com/projectcalico/cni-plugin:rw $$EXTRA_DOCKER_BIND \
       --entrypoint /bin/sh $(GO_CONTAINER_NAME) -e -c ' \
@@ -104,7 +106,7 @@ $(DEPLOY_CONTAINER_MARKER): Dockerfile build-containerized fetch-cni-bins
 fetch-cni-bins:
 	mkdir -p dist
 	mkdir -p tmp-cni
-	$(CURL) -L --retry 5 https://github.com/containernetworking/cni/releases/download/v0.3.0/cni-v0.3.0.tgz | tar -xz -C tmp-cni/
+	$(CURL) -L --retry 5 https://github.com/hitomitak/cni/releases/download/v0.4.0/cni-ppc64le-v0.4.0.tgz | tar -xz -C tmp-cni/
 	mv tmp-cni/flannel dist/flannel
 	mv tmp-cni/loopback dist/loopback
 	mv tmp-cni/host-local dist/host-local
