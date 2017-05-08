@@ -14,6 +14,7 @@
 package utils
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -24,19 +25,89 @@ import (
 
 	"strings"
 
+	"github.com/containernetworking/cni/pkg/ip"
 	"github.com/containernetworking/cni/pkg/ipam"
+	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/projectcalico/libcalico-go/lib/api"
 	"github.com/projectcalico/libcalico-go/lib/client"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
+	"github.com/vishvananda/netlink"
 )
 
-func min(a, b int) int {
+func Min(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
+}
+
+// CleanUpNamespace deletes the devices in the network namespace.
+func CleanUpNamespace(args *skel.CmdArgs, logger *log.Entry) error {
+	// Only try to delete the device if a namespace was passed in.
+	if args.Netns != "" {
+		logger.Debug("Checking namespace & device exist.")
+		devErr := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+			_, err := netlink.LinkByName(args.IfName)
+			return err
+		})
+
+		if devErr == nil {
+			fmt.Fprintf(os.Stderr, "Calico CNI deleting device in netns %s\n", args.Netns)
+			err := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+				_, err := ip.DelLinkByNameAddr(args.IfName, netlink.FAMILY_V4)
+				return err
+			})
+
+			if err != nil {
+				return err
+			}
+		} else {
+			logger.Info("veth does not exist, no need to clean up.")
+		}
+	}
+
+	return nil
+}
+
+// CleanUpIPAM calls IPAM plugin to release the IP address.
+// It also contains IPAM plugin specific changes needed before calling the plugin.
+func CleanUpIPAM(conf NetConf, args *skel.CmdArgs, logger *log.Entry) error {
+	fmt.Fprintf(os.Stderr, "Calico CNI releasing IP address\n")
+	logger.WithFields(log.Fields{"paths": os.Getenv("CNI_PATH"),
+		"type": conf.IPAM.Type}).Debug("Looking for IPAM plugin in paths")
+
+	// We need to replace "usePodCidr" with a valid, but dummy podCidr string with "host-local" IPAM.
+	if conf.IPAM.Type == "host-local" && strings.EqualFold(conf.IPAM.Subnet, "usePodCidr") {
+		// host-local IPAM releases the IP by ContainerID, so podCidr isn't really used to release the IP.
+		// It just needs a valid CIDR, but it doesn't have to be the CIDR associated with the host.
+		dummyPodCidr := "0.0.0.0/0"
+		var stdinData map[string]interface{}
+
+		err := json.Unmarshal(args.StdinData, &stdinData)
+		if err != nil {
+			return err
+		}
+
+		logger.WithField("podCidr", dummyPodCidr).Info("Using a dummy podCidr to release the IP")
+		stdinData["ipam"].(map[string]interface{})["subnet"] = dummyPodCidr
+
+		args.StdinData, err = json.Marshal(stdinData)
+		if err != nil {
+			return err
+		}
+		logger.WithField("stdin", args.StdinData).Debug("Updated stdin data for Delete Cmd")
+	}
+
+	err := ipam.ExecDel(conf.IPAM.Type, args.StdinData)
+
+	if err != nil {
+		logger.Error(err)
+	}
+
+	return err
 }
 
 // ValidateNetworkName checks that the network name meets felix's expectations
@@ -62,22 +133,21 @@ func AddIgnoreUnknownArgs() error {
 	return os.Setenv("CNI_ARGS", cniArgs)
 }
 
-func CreateResultFromEndpoint(ep *api.WorkloadEndpoint) (*types.Result, error) {
-	result := &types.Result{}
+func CreateResultFromEndpoint(ep *api.WorkloadEndpoint) (*current.Result, error) {
+	result := &current.Result{}
 
 	for _, v := range ep.Spec.IPNetworks {
-		unparsedIP := fmt.Sprintf(`{"ip": "%s"}`, v.String())
-		parsedIP := types.IPConfig{}
-		if err := parsedIP.UnmarshalJSON([]byte(unparsedIP)); err != nil {
-			log.Errorf("Error unmarshalling existing endpoint IP: %s", err)
-			return nil, err
+		parsedIPConfig := current.IPConfig{}
+
+		parsedIPConfig.Address = v.IPNet
+
+		if v.IP.To4() != nil {
+			parsedIPConfig.Version = "4"
+		} else {
+			parsedIPConfig.Version = "6"
 		}
 
-		if len(v.IP) == net.IPv4len {
-			result.IP4 = &parsedIP
-		} else {
-			result.IP6 = &parsedIP
-		}
+		result.IPs = append(result.IPs, &parsedIPConfig)
 	}
 
 	return result, nil
@@ -100,19 +170,19 @@ func GetIdentifiers(args *skel.CmdArgs) (workloadID string, orchestratorID strin
 	return workloadID, orchestratorID, nil
 }
 
-func PopulateEndpointNets(endpoint *api.WorkloadEndpoint, result *types.Result) error {
-	if result.IP4 == nil && result.IP6 == nil {
+func PopulateEndpointNets(endpoint *api.WorkloadEndpoint, result *current.Result) error {
+	if len(result.IPs) == 0 {
 		return errors.New("IPAM plugin did not return any IP addresses")
 	}
 
-	if result.IP4 != nil {
-		result.IP4.IP.Mask = net.CIDRMask(32, 32)
-		endpoint.Spec.IPNetworks = append(endpoint.Spec.IPNetworks, cnet.IPNet{result.IP4.IP})
-	}
+	for _, ip := range result.IPs {
+		if ip.Version == "4" {
+			ip.Address.Mask = net.CIDRMask(32, 32)
+		} else {
+			ip.Address.Mask = net.CIDRMask(128, 128)
+		}
 
-	if result.IP6 != nil {
-		result.IP6.IP.Mask = net.CIDRMask(128, 128)
-		endpoint.Spec.IPNetworks = append(endpoint.Spec.IPNetworks, cnet.IPNet{result.IP6.IP})
+		endpoint.Spec.IPNetworks = append(endpoint.Spec.IPNetworks, cnet.IPNet{ip.Address})
 	}
 
 	return nil

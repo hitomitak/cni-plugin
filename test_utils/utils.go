@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -20,9 +21,13 @@ import (
 
 	"syscall"
 
+	"bufio"
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/020"
+	"github.com/containernetworking/cni/pkg/types/current"
 	etcdclient "github.com/coreos/etcd/client"
+	version "github.com/mcuadros/go-version"
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega/gexec"
 	k8sbackend "github.com/projectcalico/libcalico-go/lib/backend/k8s"
@@ -54,6 +59,35 @@ func WipeEtcd() {
 	}
 }
 
+// GetResultForCurrent takes the session output with cniVersion and returns the Result in current.Result format.
+func GetResultForCurrent(session *gexec.Session, cniVersion string) (*current.Result, error) {
+
+	// Check if the version is older than 0.3.0.
+	// Convert it to Current standard spec version if that is the case.
+	if version.Compare(cniVersion, "0.3.0", "<") {
+		r020 := types020.Result{}
+
+		if err := json.Unmarshal(session.Out.Contents(), &r020); err != nil {
+			log.Fatalf("Error unmarshaling session output to Result: %v\n", err)
+		}
+
+		rCurrent, err := current.NewResultFromResult(&r020)
+		if err != nil {
+			return nil, err
+		}
+
+		return rCurrent, nil
+	}
+
+	r := current.Result{}
+
+	if err := json.Unmarshal(session.Out.Contents(), &r); err != nil {
+		log.Fatalf("Error unmarshaling session output to Result: %v\n", err)
+	}
+	return &r, nil
+
+}
+
 // Delete all K8s pods from the "test" namespace
 func WipeK8sPods() {
 	config, err := clientcmd.DefaultClientConfig.ClientConfig()
@@ -81,7 +115,7 @@ func WipeK8sPods() {
 
 // RunIPAMPlugin sets ENV vars required then calls the IPAM plugin
 // specified in the config and returns the result and exitCode.
-func RunIPAMPlugin(netconf, command, args string) (types.Result, types.Error, int) {
+func RunIPAMPlugin(netconf, command, args, cniVersion string) (*current.Result, types.Error, int) {
 	conf := types.NetConf{}
 	if err := json.Unmarshal([]byte(netconf), &conf); err != nil {
 		panic(fmt.Errorf("failed to load netconf: %v", err))
@@ -107,13 +141,15 @@ func RunIPAMPlugin(netconf, command, args string) (types.Result, types.Error, in
 	}
 	session.Wait(5)
 	exitCode := session.ExitCode()
-	result := types.Result{}
+
+	result := &current.Result{}
 	error := types.Error{}
 	stdout := session.Out.Contents()
 	if exitCode == 0 {
 		if command == "ADD" {
-			if err := json.Unmarshal(stdout, &result); err != nil {
-				panic(fmt.Errorf("failed to load result: %s %v", stdout, err))
+			result, err = GetResultForCurrent(session, cniVersion)
+			if err != nil {
+				log.Fatalf("Error getting result from the session: %v \n %v\n", session, err)
 			}
 		}
 	} else {
@@ -154,17 +190,26 @@ func CreateContainerNamespaceWithCid(container_id string) (containerNs ns.NetNS,
 	return
 }
 
-func CreateContainer(netconf string, k8sName string, ip string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, err error) {
+func CreateContainer(netconf string, k8sName string, ip string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, targetNs ns.NetNS, err error) {
 	return CreateContainerWithId(netconf, k8sName, ip, "")
 }
 
 // Create container with the giving containerId when containerId is not empty
-func CreateContainerWithId(netconf string, k8sName string, ip string, containerId string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, err error) {
-	targetNs, container_id, netnspath, err := CreateContainerNamespaceWithCid(containerId)
+func CreateContainerWithId(netconf string, k8sName string, ip string, containerId string) (container_id, netnspath string, session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, targetNs ns.NetNS, err error) {
+	targetNs, container_id, netnspath, err = CreateContainerNamespaceWithCid(containerId)
 
 	if err != nil {
-		return "", "", nil, nil, nil, nil, err
+		return "", "", nil, nil, nil, nil, nil, err
 	}
+
+	session, contVeth, contAddr, contRoutes, err = RunCNIPluginWithId(netconf, k8sName, ip, netnspath, container_id, targetNs)
+
+	return
+}
+
+// RunCNIPluginWithId calls CNI plugin with a containerID and targetNs passed to it.
+// This is for when you want to call CNI for an existing container.
+func RunCNIPluginWithId(netconf string, k8sName string, ip string, netnspath, containerId string, targetNs ns.NetNS) (session *gexec.Session, contVeth netlink.Link, contAddr []netlink.Addr, contRoutes []netlink.Route, err error) {
 
 	// Set up the env for running the CNI plugin
 	//TODO pass in the env properly
@@ -177,7 +222,7 @@ func CreateContainerWithId(netconf string, k8sName string, ip string, containerI
 			k8s_env = fmt.Sprintf("%s;IP=%s\"", strings.TrimRight(k8s_env, "\""), ip)
 		}
 	}
-	cni_env := fmt.Sprintf("CNI_COMMAND=ADD CNI_CONTAINERID=%s CNI_NETNS=%s CNI_IFNAME=eth0 CNI_PATH=dist %s", container_id, netnspath, k8s_env)
+	cni_env := fmt.Sprintf("CNI_COMMAND=ADD CNI_CONTAINERID=%s CNI_NETNS=%s CNI_IFNAME=eth0 CNI_PATH=dist %s", containerId, netnspath, k8s_env)
 
 	// Run the CNI plugin passing in the supplied netconf
 	//TODO - Get rid of this PLUGIN thing and use netconf instead
@@ -332,4 +377,28 @@ func CmdWithStdin(cmd, stdin_string string) string {
 	//}
 
 	return stdout_buf.String()
+}
+
+// CheckSysctlValue is a utility function to assert sysctl value is set to what is expected.
+func CheckSysctlValue(sysctlPath, value string) error {
+	fh, err := os.Open(sysctlPath)
+	if err != nil {
+		return err
+	}
+
+	f := bufio.NewReader(fh)
+	defer fh.Close()
+
+	// Ignoring second output (isPrefix) since it's not necessory
+	buf, _, err := f.ReadLine()
+	if err != nil {
+		// EOF without a match
+		return err
+	}
+
+	if string(buf) != value {
+		return fmt.Errorf("error asserting sysctl value: expected: %s, got: %s for sysctl path: %s", value, string(buf), sysctlPath)
+	}
+
+	return nil
 }

@@ -14,6 +14,7 @@
 package k8s
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -23,9 +24,11 @@ import (
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/projectcalico/cni-plugin/utils"
 	"github.com/projectcalico/libcalico-go/lib/api"
 	k8sbackend "github.com/projectcalico/libcalico-go/lib/backend/k8s"
+	cerrors "github.com/projectcalico/libcalico-go/lib/errors"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 
 	"encoding/json"
@@ -41,9 +44,9 @@ import (
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
 // Having kubernetes code in its own file avoids polluting the mainline code. It's expected that the kubernetes case will
 // more special casing than the mainline code.
-func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, nodename string, calicoClient *calicoclient.Client, endpoint *api.WorkloadEndpoint) (*types.Result, error) {
+func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, nodename string, calicoClient *calicoclient.Client, endpoint *api.WorkloadEndpoint) (*current.Result, error) {
 	var err error
-	var result *types.Result
+	var result *current.Result
 
 	k8sArgs := utils.K8sArgs{}
 	err = types.LoadArgs(args.Args, &k8sArgs)
@@ -180,11 +183,25 @@ func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, nodename string, calicoCl
 		case ipAddrs == "" && ipAddrsNoIpam == "":
 			// Call IPAM plugin if ipAddrsNoIpam or ipAddrs annotation is not present.
 			logger.Debugf("Calling IPAM plugin %s", conf.IPAM.Type)
-			result, err = ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
+			ipamResult, err := ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
 			if err != nil {
 				return nil, err
 			}
-			logger.Debugf("IPAM plugin returned: %+v", result)
+			logger.Debugf("IPAM plugin returned: %+v", ipamResult)
+
+			// Convert IPAM result into current Result.
+			// IPAM result has a bunch of fields that are optional for an IPAM plugin
+			// but required for a CNI plugin, so this is to populate those fields.
+			// See CNI Spec doc for more details.
+			result, err = current.NewResultFromResult(ipamResult)
+			if err != nil {
+				return nil, err
+			}
+
+			if len(result.IPs) == 0 {
+				return nil, errors.New("IPAM plugin returned missing IP config")
+			}
+
 		case ipAddrs != "" && ipAddrsNoIpam != "":
 			// Can't have both ipAddrs and ipAddrsNoIpam annotations at the same time.
 			e := fmt.Errorf("Can't have both annotations: 'ipAddrs' and 'ipAddrsNoIpam' in use at the same time")
@@ -192,11 +209,23 @@ func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, nodename string, calicoCl
 			return nil, e
 		case ipAddrsNoIpam != "":
 			// ipAddrsNoIpam annotation is set so bypass IPAM, and set the IPs manually.
-			result, err = overrideIPAMResult(ipAddrsNoIpam, logger)
+			overriddenResult, err := overrideIPAMResult(ipAddrsNoIpam, logger)
 			if err != nil {
 				return nil, err
 			}
-			logger.Debugf("Bypassing IPAM to set the result to: %+v", result)
+			logger.Debugf("Bypassing IPAM to set the result to: %+v", overriddenResult)
+
+			// Convert overridden IPAM result into current Result.
+			// This method fill in all the empty fields necessory for CNI output according to spec.
+			result, err = current.NewResultFromResult(overriddenResult)
+			if err != nil {
+				return nil, err
+			}
+
+			if len(result.IPs) == 0 {
+				return nil, errors.New("IPAM plugin returned missing IP config")
+			}
+
 		case ipAddrs != "":
 			// When ipAddrs annotation is set, we call out to the configured IPAM plugin
 			// requesting the specific IP addresses included in the annotation.
@@ -211,6 +240,7 @@ func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, nodename string, calicoCl
 		endpoint = api.NewWorkloadEndpoint()
 		endpoint.Metadata.Name = args.IfName
 		endpoint.Metadata.Node = nodename
+		endpoint.Metadata.ActiveInstanceID = args.ContainerID
 		endpoint.Metadata.Orchestrator = orchestrator
 		endpoint.Metadata.Workload = workload
 		endpoint.Metadata.Labels = labels
@@ -266,10 +296,71 @@ func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, nodename string, calicoCl
 	return result, nil
 }
 
+// CmdDelK8s performs the "DEL" operation on a kubernetes pod.
+// The following logic only applies to kubernetes since it sends multiple DELs for the same
+// endpoint. See: https://github.com/kubernetes/kubernetes/issues/44100
+// We store CNI_CONTAINERID as ActiveInstanceID in WEP Metadata for k8s,
+// so in this function we need to get the WEP and make sure we check if ContainerID and ActiveInstanceID
+// are the same before deleting the pod being deleted.
+func CmdDelK8s(c *calicoclient.Client, ep api.WorkloadEndpointMetadata, args *skel.CmdArgs, conf utils.NetConf, logger *log.Entry) error {
+	wep, err := c.WorkloadEndpoints().Get(ep)
+	if err != nil {
+		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
+			// We can talk to the datastore but WEP doesn't exist in there,
+			// but we still want to go ahead with the clean up. So, log a warning and continue with the clean up.
+			logger.WithField("WorkloadEndpoint", ep).Warning("WorkloadEndpoint does not exist in the datastore, moving forward with the clean up")
+		} else {
+			// Could not connect to datastore (connection refused, unauthorized, etc.)
+			// so we have no way of knowing/checking ActiveInstanceID. To protect the endpoint
+			// from false DEL, we return the error without deleting/cleaning up.
+			return err
+		}
+
+		// Check if ActiveInstanceID is populated (it will be an empty string "" if it was populated
+		// before this field was added to the API), and if it is there then compare it with ContainerID
+		// passed by the orchestrator to make sure they are the same, return without deleting if they aren't.
+	} else if wep.Metadata.ActiveInstanceID != "" && args.ContainerID != wep.Metadata.ActiveInstanceID {
+		logger.WithField("WorkloadEndpoint", wep).Warning("CNI_ContainerID does not match WorkloadEndpoint ActiveInstanceID so ignoring the DELETE cmd.")
+		return nil
+
+		// Delete the WorkloadEndpoint object from the datastore.
+		// In case of k8s, where we are deleting the WEP we got from the Datastore,
+		// this Delete is a Compare-and-Delete, so if *any* field in the WEP changed from
+		// the time we get WEP until here then the Delete operation will fail.
+	} else if err = c.WorkloadEndpoints().Delete(wep.Metadata); err != nil {
+		switch err := err.(type) {
+		case cerrors.ErrorResourceDoesNotExist:
+			// Log and proceed with the clean up if WEP doesn't exist.
+			logger.WithField("endpoint", wep).Info("Endpoint object does not exist, no need to clean up.")
+		case cerrors.ErrorResourceUpdateConflict:
+			// This case means the WEP object was modified between the time we did the Get and now,
+			// so it's not a safe Compare-and-Delete operation, so log and abort with the error.
+			// Returning an error here is with the assumption that k8s (kubelet) retries deleting again.
+			logger.WithField("endpoint", wep).Warning("Error deleting endpoint: endpoint was modified before it could be deleted.")
+			return fmt.Errorf("Error deleting endpoint: endpoint was modified before it could be deleted: %v", err)
+		default:
+			return err
+		}
+	}
+
+	// Release the IP address by calling the configured IPAM plugin.
+	ipamErr := utils.CleanUpIPAM(conf, args, logger)
+
+	// Clean up namespace by removing the interfaces.
+	err = utils.CleanUpNamespace(args, logger)
+	if err != nil {
+		return err
+	}
+
+	// Return the IPAM error if there was one. The IPAM error will be lost if there was also an error in cleaning up
+	// the device or endpoint, but crucially, the user will know the overall operation failed.
+	return ipamErr
+}
+
 // ipAddrsResult parses the ipAddrs annotation and calls the configured IPAM plugin for
 // each IP passed to it by setting the IP field in CNI_ARGS, and returns the result of calling the IPAM plugin.
 // Example annotation value string: "[\"10.0.0.1\", \"2001:db8::1\"]"
-func ipAddrsResult(ipAddrs string, conf utils.NetConf, args *skel.CmdArgs, logger *log.Entry) (*types.Result, error) {
+func ipAddrsResult(ipAddrs string, conf utils.NetConf, args *skel.CmdArgs, logger *log.Entry) (*current.Result, error) {
 
 	logger.Infof("Parsing annotation \"cni.projectcalico.org/ipAddrs\":%s", ipAddrs)
 	ips, err := parseIPAddrs(ipAddrs, logger)
@@ -282,7 +373,7 @@ func ipAddrsResult(ipAddrs string, conf utils.NetConf, args *skel.CmdArgs, logge
 		return nil, fmt.Errorf("Annotation \"cni.projectcalico.org/ipAddrs\" specified but empty")
 	}
 
-	result := types.Result{}
+	result := current.Result{}
 
 	// Go through all the IPs passed in as annotation value and call IPAM plugin
 	// for each, and populate the result variable with IP4 and/or IP6 IPs returned
@@ -295,53 +386,23 @@ func ipAddrsResult(ipAddrs string, conf utils.NetConf, args *skel.CmdArgs, logge
 			return nil, fmt.Errorf("Invalid IP format: %s", ip)
 		}
 
-		// It's an IPv6 address if ip.To4 is nil.
-		if ipAddr.To4() == nil {
-			// CNI spec only allows one IPv4 and one IPv6 at the moment.
-			// So if we see more than one of IPv4 or IPv6 then we throw an error.
-			// If/when CNI spec supports more than one IP, we can loosen this requirement.
-			if result.IP6 != nil {
-				e := fmt.Errorf("Can not have more than one IPv6 address in ipAddrs annotation")
-				logger.Error(e)
-				return nil, e
-			}
-
-			// Call callIPAMWithIP with the ip address.
-			r, err := callIPAMWithIP(ipAddr, conf, args, logger)
-			if err != nil {
-				return nil, fmt.Errorf("Error getting IP from IPAM: %s", err)
-			}
-
-			// Set the IP6 part of the result from the type.Result returned by the IPAM plugin.
-			result.IP6 = r.IP6
-			logger.Debugf("Adding IPv6: %s to result", ipAddr.String())
-		} else {
-			// It's an IPv4 address.
-			if result.IP4 != nil {
-				e := fmt.Errorf("Can not have more than one IPv4 address in ipAddrs annotation")
-				logger.Error(e)
-				return nil, e
-			}
-
-			// Call callIPAMWithIP with the ip address.
-			r, err := callIPAMWithIP(ipAddr, conf, args, logger)
-			if err != nil {
-				return nil, fmt.Errorf("Error getting IP from IPAM: %s", err)
-			}
-
-			// Set the IP4 part of the result from the type.Result returned by the IPAM plugin.
-			result.IP4 = r.IP4
-			logger.Debugf("Adding IPv4: %s to result", ipAddr.String())
+		// Call callIPAMWithIP with the ip address.
+		r, err := callIPAMWithIP(ipAddr, conf, args, logger)
+		if err != nil {
+			return nil, fmt.Errorf("Error getting IP from IPAM: %s", err)
 		}
+
+		result.IPs = append(result.IPs, r.IPs[0])
+		logger.Debugf("Adding IPv%s: %s to result", r.IPs[0].Version, ipAddr.String())
 	}
 
 	return &result, nil
 }
 
 // callIPAMWithIP sets CNI_ARGS with the IP and calls the IPAM plugin with it
-// to get types.Result and then it unsets the IP field from CNI_ARGS ENV var,
+// to get current.Result and then it unsets the IP field from CNI_ARGS ENV var,
 // so it doesn't pollute the subsequent requests.
-func callIPAMWithIP(ip net.IP, conf utils.NetConf, args *skel.CmdArgs, logger *log.Entry) (*types.Result, error) {
+func callIPAMWithIP(ip net.IP, conf utils.NetConf, args *skel.CmdArgs, logger *log.Entry) (*current.Result, error) {
 
 	// Save the original value of the CNI_ARGS ENV var for backup.
 	originalArgs := os.Getenv("CNI_ARGS")
@@ -393,13 +454,26 @@ func callIPAMWithIP(ip net.IP, conf utils.NetConf, args *skel.CmdArgs, logger *l
 		return nil, err
 	}
 
-	return r, nil
+	// Convert IPAM result into current Result.
+	// IPAM result has a bunch of fields that are optional for an IPAM plugin
+	// but required for a CNI plugin, so this is to populate those fields.
+	// See CNI Spec doc for more details.
+	ipamResult, err := current.NewResultFromResult(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ipamResult.IPs) == 0 {
+		return nil, errors.New("IPAM plugin returned missing IP config")
+	}
+
+	return ipamResult, nil
 }
 
-// overrideIPAMResult generates types.Result like the one produced by IPAM plugin,
+// overrideIPAMResult generates current.Result like the one produced by IPAM plugin,
 // but sets IP field manually since IPAM is bypassed with this annotation.
 // Example annotation value string: "[\"10.0.0.1\", \"2001:db8::1\"]"
-func overrideIPAMResult(ipAddrsNoIpam string, logger *log.Entry) (*types.Result, error) {
+func overrideIPAMResult(ipAddrsNoIpam string, logger *log.Entry) (*current.Result, error) {
 
 	logger.Infof("Parsing annotation \"cni.projectcalico.org/ipAddrsNoIpam\":%s", ipAddrsNoIpam)
 	ips, err := parseIPAddrs(ipAddrsNoIpam, logger)
@@ -412,12 +486,10 @@ func overrideIPAMResult(ipAddrsNoIpam string, logger *log.Entry) (*types.Result,
 		return nil, fmt.Errorf("Annotation \"cni.projectcalico.org/ipAddrsNoIpam\" specified but empty")
 	}
 
-	result := types.Result{}
+	result := current.Result{}
 
 	// Go through all the IPs passed in as annotation value and populate
 	// the result variable with IP4 and/or IP6 IPs.
-	// We also make sure there is only one IPv4 and/or one IPv6 passed in,
-	// since CNI spec only supports one of each right now.
 	for _, ip := range ips {
 		ipAddr := net.ParseIP(ip)
 		if ipAddr == nil {
@@ -425,38 +497,26 @@ func overrideIPAMResult(ipAddrsNoIpam string, logger *log.Entry) (*types.Result,
 			return nil, fmt.Errorf("Invalid IP format: %s", ip)
 		}
 
-		// It's an IPv6 address if ip.To4 is nil.
-		if ipAddr.To4() == nil {
-			// CNI spec only allows one IPv4 and one IPv6 at the moment.
-			// So if we see more than one of IPv4 or IPv6 then we throw an error.
-			// If/when CNI spec supports more than one IP, we can loosen this requirement.
-			if result.IP6 != nil {
-				e := fmt.Errorf("Can not have more than one IPv6 address in ipAddrsNoIpam annotation")
-				logger.Error(e)
-				return nil, e
-			}
-			result.IP6 = &types.IPConfig{
-				IP: net.IPNet{
-					IP:   ipAddr,
-					Mask: net.CIDRMask(128, 128),
-				},
-			}
-			logger.Debugf("Adding IPv6: %s to result", ipAddr.String())
+		var version string
+		var mask net.IPMask
+
+		if ipAddr.To4() != nil {
+			version = "4"
+			mask = net.CIDRMask(32, 32)
 		} else {
-			// It's an IPv4 address.
-			if result.IP4 != nil {
-				e := fmt.Errorf("Can not have more than one IPv4 address in ipAddrsNoIpam annotation")
-				logger.Error(e)
-				return nil, e
-			}
-			result.IP4 = &types.IPConfig{
-				IP: net.IPNet{
-					IP:   ipAddr,
-					Mask: net.CIDRMask(32, 32),
-				},
-			}
-			logger.Debugf("Adding IPv4: %s to result", ipAddr.String())
+			version = "6"
+			mask = net.CIDRMask(128, 128)
 		}
+
+		ipConf := &current.IPConfig{
+			Version: version,
+			Address: net.IPNet{
+				IP:   ipAddr,
+				Mask: mask,
+			},
+		}
+		result.IPs = append(result.IPs, ipConf)
+		logger.Debugf("Adding IPv%s: %s to result", ipConf.Version, ipAddr.String())
 	}
 
 	return &result, nil
